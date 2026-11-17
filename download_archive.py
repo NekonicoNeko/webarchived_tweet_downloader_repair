@@ -8297,5 +8297,154 @@ def main():
 
 
 
+
+# WTD_CDX_INCREMENTAL_REFRESH_V1 BEGIN
+import json as _wtd_cdx_merge_json
+import os as _wtd_cdx_merge_os
+import tempfile as _wtd_cdx_merge_tempfile
+
+_wtd_cdx_merge_orig_resolve = resolve_snapshot_records
+_wtd_cdx_merge_orig_write = write_snapshot_manifest
+_wtd_cdx_merge_state = None
+
+
+def _wtd_cdx_merge_read_manifest(asset_dir, user):
+    path = snapshot_manifest_path(asset_dir)
+    if not path.is_file():
+        return None, None
+    raw = path.read_bytes()
+    try:
+        data = _wtd_cdx_merge_json.loads(raw.decode('utf-8-sig'))
+    except (UnicodeError, ValueError) as exc:
+        raise RuntimeError('CDX 增量刷新已中止：原 snapshots.json 无法解析，拒绝覆盖：' + str(exc)) from exc
+    if not isinstance(data, dict) or not isinstance(data.get('snapshots'), list):
+        raise RuntimeError('CDX 增量刷新已中止：原 snapshots.json 结构错误，拒绝覆盖。')
+    old_user = data.get('user')
+    if old_user and (not isinstance(old_user, str) or old_user.casefold() != str(user).casefold()):
+        raise RuntimeError('CDX 增量刷新已中止：snapshots.json 所属账号和指定账号不符。')
+    for item in data['snapshots']:
+        if not isinstance(item, dict) or not isinstance(item.get('json_filename'), str) or not item['json_filename']:
+            raise RuntimeError('CDX 增量刷新已中止：原 snapshots.json 含无法保留的记录，拒绝覆盖。')
+    return data, raw
+
+
+def _wtd_cdx_merge_record_key(record):
+    path = getattr(record, 'json_path', None)
+    name = getattr(path, 'name', '')
+    if not isinstance(name, str) or not name or '/' in name or '\\' in name:
+        raise RuntimeError('CDX 增量刷新已中止：发现无法识别目标文件名的快照记录。')
+    return name.casefold()
+
+
+def resolve_snapshot_records(user, asset_dir, json_dir, resume=True, refresh=False):
+    global _wtd_cdx_merge_state
+    if not refresh:
+        _wtd_cdx_merge_state = None
+        return _wtd_cdx_merge_orig_resolve(user, asset_dir, json_dir, resume=resume, refresh=False)
+
+    if not resume:
+        raise RuntimeError('CDX 增量刷新已中止：不能与 --no-resume 同时使用；为避免覆盖浏览器导入的 JSON，请使用默认断点续传。')
+
+    # 严格读取真实原清单；损坏或账号错配时不允许远端结果覆盖它。
+    old_payload, old_raw = _wtd_cdx_merge_read_manifest(asset_dir, user)
+    previous = list(load_snapshot_records(asset_dir, json_dir, user))
+    # 原始 resolve 只负责查询 CDX / 构造记录；不负责写清单。
+    remote, origin = _wtd_cdx_merge_orig_resolve(
+        user, asset_dir, json_dir, resume=resume, refresh=True)
+    if not isinstance(remote, list):
+        raise RuntimeError('CDX 增量刷新已中止：远端快照列表结构异常，原清单未修改。')
+
+    seen = set()
+    merged = list(previous)
+    for record in previous:
+        seen.add(_wtd_cdx_merge_record_key(record))
+    added = 0
+    for record in remote:
+        key = _wtd_cdx_merge_record_key(record)
+        if key not in seen:
+            merged.append(record)
+            seen.add(key)
+            added += 1
+
+    if not remote and previous:
+        print('CDX 刷新返回空列表或查询失败；保留全部本地快照清单（没有删除记录）。', flush=True)
+        origin = 'local'
+    elif remote:
+        print('CDX 增量合并：原有 %d 条，新发现 %d 条，合并后 %d 条。'
+              % (len(previous), added, len(merged)), flush=True)
+
+    # 写入时只增不减；保留旧清单的原始行、字段、顺序、文件名。
+    _wtd_cdx_merge_state = {
+        'manifest_path': snapshot_manifest_path(asset_dir),
+        'user': str(user),
+        'expected_raw': old_raw,
+        'old_payload': old_payload,
+    }
+    return merged, origin
+
+
+def write_snapshot_manifest(asset_dir, user, records):
+    global _wtd_cdx_merge_state
+    state = _wtd_cdx_merge_state
+    if state is None or state['manifest_path'] != snapshot_manifest_path(asset_dir):
+        return _wtd_cdx_merge_orig_write(asset_dir, user, records)
+    if str(user).casefold() != state['user'].casefold():
+        raise RuntimeError('CDX 增量刷新：准备写入其他账号清单，已拒绝。')
+
+    path = state['manifest_path']
+    current_raw = path.read_bytes() if path.is_file() else None
+    if current_raw != state['expected_raw']:
+        raise RuntimeError('CDX 增量刷新：snapshots.json 在扫描期间已改变，拒绝覆盖。')
+    base = state['old_payload']
+    result = dict(base) if base is not None else {'user': str(user), 'snapshots': []}
+    old_rows = list(result['snapshots'])
+    seen = {row['json_filename'].casefold() for row in old_rows}
+    appended = 0
+    for record in records:
+        name = getattr(getattr(record, 'json_path', None), 'name', '')
+        key = _wtd_cdx_merge_record_key(record)
+        if key in seen:
+            continue
+        old_rows.append({
+            'timestamp': str(record.timestamp),
+            'original_url': str(record.original_url),
+            'json_filename': name,
+        })
+        seen.add(key)
+        appended += 1
+    result['snapshots'] = old_rows
+    if not result.get('user'):
+        result['user'] = str(user)
+
+    # 结果无变化时不重写，保持旧文件的字节和修改时间。
+    if base is not None and result == base:
+        return None
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = None
+    try:
+        with _wtd_cdx_merge_tempfile.NamedTemporaryFile(
+            mode='w', encoding='utf-8', newline='\n',
+            prefix='.snapshots-cdx-merge-', suffix='.tmp',
+            dir=path.parent, delete=False) as fh:
+            tmp = path.parent / _wtd_cdx_merge_os.path.basename(fh.name)
+            _wtd_cdx_merge_json.dump(result, fh, ensure_ascii=False, indent=2)
+            fh.write('\n')
+            fh.flush()
+            _wtd_cdx_merge_os.fsync(fh.fileno())
+        reread = _wtd_cdx_merge_json.loads(tmp.read_text(encoding='utf-8'))
+        if reread != result:
+            raise RuntimeError('CDX 增量刷新：临时清单校验失败，原清单未动。')
+        _wtd_cdx_merge_os.replace(tmp, path)
+        state['expected_raw'] = path.read_bytes()
+        state['old_payload'] = result
+        print('CDX 增量清单：保留 %d 条原记录，新增 %d 条。'
+              % (len(old_rows) - appended, appended), flush=True)
+    finally:
+        if tmp is not None:
+            tmp.unlink(missing_ok=True)
+    return None
+# WTD_CDX_INCREMENTAL_REFRESH_V1 END
+
 if __name__ == "__main__":
     main()
