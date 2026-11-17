@@ -29,3 +29,10 @@ python "browser_response_import.py" scan username "response.txt"（或--scan）
 修复导入器已导入的推文上级回复链未嵌入本地上级回复的问题（de旧版本的bug用，只有用旧版本导入过的才需要跑，现在已经没这个bug了）
 
 支持--json-only、--workers N、--help
+
+————————————————————————————————————————————————————
+
+wtd_archive_diagnose  
+扫描归档文件缺失推文，生成诊断报告  
+
+python wtd_archive_diagnose.py username
